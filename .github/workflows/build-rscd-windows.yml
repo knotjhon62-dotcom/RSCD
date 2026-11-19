@@ -9,16 +9,15 @@ permissions:
 jobs:
   build:
     runs-on: windows-2022
-    timeout-minutes: 60
+    timeout-minutes: 90
     env:
       TORCH_CUDA_ARCH_LIST: '8.6'
-      MAX_JOBS: '1'
       DISTUTILS_USE_SDK: '1'
-      NVCC_APPEND_FLAGS: '-allow-unsupported-compiler -D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH -Xcompiler=/bigobj'
-      CL: '/bigobj /D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH'
+      CL: '/bigobj'
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out RSCD
+        uses: actions/checkout@v4
         with:
           repository: zzh-tech/RSCD
           ref: 676a504bade9b4385d2e3fb19f52b769273464ff
@@ -30,18 +29,66 @@ jobs:
           python-version: '3.10'
           architecture: x64
 
-      - uses: Jimver/cuda-toolkit@v0.2.19
+      - name: Install MSVC 14.38
+        shell: pwsh
+        run: |
+          $installer = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer'
+          $vswhere = Join-Path $installer 'vswhere.exe'
+          $vsPath = & $vswhere -latest -products '*' -property installationPath
+          if (-not $vsPath) { throw 'Visual Studio installation not found' }
+
+          $compiler = Join-Path $vsPath 'VC\Tools\MSVC\14.38.*\bin\Hostx64\x64\cl.exe'
+          if (-not (Test-Path -Path $compiler)) {
+            $process = Start-Process `
+              -FilePath (Join-Path $installer 'setup.exe') `
+              -ArgumentList @(
+                'modify', '--installPath', "`"$vsPath`"",
+                '--add', 'Microsoft.VisualStudio.Component.VC.14.38.17.8.x86.x64',
+                '--quiet', '--norestart'
+              ) -Wait -PassThru
+
+            if ($process.ExitCode -notin @(0, 3010)) {
+              throw "Visual Studio Installer exited with code $($process.ExitCode)"
+            }
+          }
+
+          if (-not (Test-Path -Path $compiler)) {
+            throw 'MSVC 14.38 x64 compiler not found'
+          }
+
+      - name: Install CUDA 12.4
+        uses: Jimver/cuda-toolkit@v0.2.19
         with:
           cuda: '12.4.0'
           method: network
           use-github-cache: false
           sub-packages: '["nvcc","cudart","thrust","visual_studio_integration","nvrtc","nvrtc_dev","cublas_dev","curand_dev","cusparse_dev","cusolver_dev"]'
 
-      - uses: ilammy/msvc-dev-cmd@v1
+      - name: Select MSVC 14.38
+        uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
+          toolset: '14.38'
 
-      - name: Prepare RSCD for Windows and CUDA 12
+      - name: Verify compiler with RSCD correlation kernel
+        shell: pwsh
+        working-directory: rscd
+        run: |
+          if ($env:VCToolsVersion -notlike '14.38.*') {
+            throw "Expected MSVC 14.38, got $env:VCToolsVersion"
+          }
+          Write-Host "MSVC toolset: $env:VCToolsVersion"
+
+          $cl = Join-Path $env:VCToolsInstallDir 'bin\Hostx64\x64'
+          $source = 'packages_from_deepunrollnet/package_correlation/correlation_package_lib/corr_cuda_kernel.cu'
+          $object = Join-Path $env:RUNNER_TEMP 'rscd-correlation-probe.obj'
+          nvcc -v --use-local-env -ccbin "$cl" -std=c++17 -arch=sm_86 `
+            -Xcompiler /MD -c "$source" -o "$object"
+          if ($LASTEXITCODE -ne 0) {
+            throw "NVCC correlation compile failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Apply Windows and CUDA 12 compatibility edits
         shell: bash
         working-directory: rscd
         run: |
@@ -49,32 +96,39 @@ jobs:
           python - <<'PY'
           from pathlib import Path
           import re
+          from textwrap import dedent, indent
 
           packages = Path("packages_from_deepunrollnet")
 
-          # Use the C++ suffix recognized by the Windows build tools.
           for name in ("correlation", "forward_warp"):
               package = packages / f"package_{name}"
               binding = package / f"{name}_package_lib" / "python_bind.cc"
               binding.rename(binding.with_suffix(".cpp"))
               setup = package / "setup.py"
-              setup.write_text(setup.read_text().replace("python_bind.cc", "python_bind.cpp"))
+              source = setup.read_text()
+              assert "python_bind.cc" in source and "'build_ext': BuildExtension" in source
+              source = source.replace("python_bind.cc", "python_bind.cpp")
+              source = source.replace(
+                  "'build_ext': BuildExtension",
+                  "'build_ext': BuildExtension.with_options(use_ninja=False)",
+              )
+              setup.write_text(source)
 
-          # CUDA 12 removed texture references. RSCD's warp only uses
-          # the memory-layout kernels in this file.
+          # Remove unused legacy texture code. Keep the memory-layout kernels.
           warp = packages / "package_forward_warp"
           native = warp / "forward_warp_package_lib"
           cu = native / "cuda_common.cu"
           source = cu.read_text()
           layout = "template<class T>\n__global__ void from_pytorch_mem_layout_kernel"
           source = source[:source.index("texture<")] + source[source.index(layout):]
-          source, count = re.subn(
+          source, definitions = re.subn(
               r"template<class T>\nvoid cudaTextureToCudaMem\(.*?\n\}\n",
               "", source, flags=re.S,
           )
-          assert count == 1
-          source, count = re.subn(r"^template void cudaTextureToCudaMem.*\n", "", source, flags=re.M)
-          assert count == 3
+          source, instantiations = re.subn(
+              r"^template void cudaTextureToCudaMem.*\n", "", source, flags=re.M,
+          )
+          assert (definitions, instantiations) == (1, 3)
           cu.write_text(source)
 
           header = native / "cuda_common.h"
@@ -83,21 +137,25 @@ jobs:
           end = source.index("template<class T>\nvoid from_pytorch_mem_layout")
           header.write_text(source[:start] + source[end:])
 
-          # The warp consumes only the integer XY grid. Construct it
-          # directly so inference does not need the old meshzoo release.
+          # Build the same integer XY grid without computing unused mesh faces.
           shift = warp / "forward_warp_package/flow_forward_shift.py"
           source = shift.read_text().replace("from .utils import generate_2D_mesh\n", "")
-          original = "grid, _ = generate_2D_mesh(H,W)\n        grid = grid.int().cuda().unsqueeze(0)"
+          original = (
+              "        grid, _ = generate_2D_mesh(H,W)\n"
+              "        grid = grid.int().cuda().unsqueeze(0)"
+          )
           assert original in source
-          shift.write_text(source.replace(original, """y, x = torch.meshgrid(
+          replacement = dedent("""\
+              y, x = torch.meshgrid(
                   torch.arange(H, device="cuda", dtype=torch.int32),
                   torch.arange(W, device="cuda", dtype=torch.int32),
                   indexing="ij",
               )
-              grid = torch.stack((x, y)).unsqueeze(0)"""))
+              grid = torch.stack((x, y)).unsqueeze(0)""")
+          shift.write_text(source.replace(original, indent(replacement, " " * 8)))
 
           # Torchvision infers offset groups from the offset tensor.
-          # Keep weights and biases at the same paths for JCD checkpoints.
+          # Preserve the JCD checkpoint's parameter names and tensor shapes.
           model = Path("model/utils.py")
           source = model.read_text()
           original = "from detectron2.layers import ModulatedDeformConv, DeformConv"
@@ -117,24 +175,27 @@ jobs:
           """))
           PY
 
-      - name: Build wheels
-        shell: bash
+      - name: Build RSCD wheels
+        shell: pwsh
         working-directory: rscd
         run: |
-          set -euo pipefail
-          export PATH="$(cygpath -u "$VCToolsInstallDir")/bin/HostX64/x64:$PATH"
-          nvcc --version
-          python -m pip install "setuptools<81" wheel ninja numpy==1.26.4
-          python -m pip install --index-url https://download.pytorch.org/whl/cu124 \
+          $PSNativeCommandUseErrorActionPreference = $true
+          $cl = Join-Path $env:VCToolsInstallDir 'bin\Hostx64\x64'
+          $env:Path = "$cl;$env:Path"
+
+          python -m pip install setuptools==75.8.2 wheel numpy==1.26.4
+          python -m pip install --index-url https://download.pytorch.org/whl/cu124 `
             torch==2.5.0+cu124 torchvision==0.20.0+cu124
 
-          mkdir -p ../bundle/wheels
-          for package in package_core package_correlation package_forward_warp; do
-            python -m pip wheel --no-build-isolation --no-deps \
-              "./packages_from_deepunrollnet/$package" -w ../bundle/wheels
-          done
+          $wheels = Join-Path $env:GITHUB_WORKSPACE 'bundle\wheels'
+          New-Item -ItemType Directory -Force -Path $wheels | Out-Null
 
-      - name: Package installer and test imports
+          foreach ($package in @('package_core', 'package_correlation', 'package_forward_warp')) {
+            python -m pip wheel -v --no-build-isolation --no-deps `
+              ".\packages_from_deepunrollnet\$package" -w "$wheels"
+          }
+
+      - name: Package installer and verify imports
         shell: bash
         run: |
           set -euo pipefail
@@ -158,20 +219,24 @@ jobs:
               }
           }
 
-          Invoke-Checked 'py' @('-3.10', '-c', 'import struct; assert struct.calcsize("P") == 8, "Install 64-bit Python 3.10"')
+          $wheels = @(Get-ChildItem -LiteralPath 'wheels' -Filter '*.whl' -File)
+          if ($wheels.Count -ne 3) {
+              throw 'Expected three RSCD wheels in the wheels folder'
+          }
+
+          Invoke-Checked 'py' @('-3.10', '-c', 'import sys; assert sys.maxsize > 2**32')
           Invoke-Checked 'py' @('-3.10', '-m', 'venv', '.venv')
           $python = Join-Path $PSScriptRoot '.venv\Scripts\python.exe'
+
           Invoke-Checked $python @(
               '-m', 'pip', 'install', '--index-url', 'https://download.pytorch.org/whl/cu124',
               'torch==2.5.0+cu124', 'torchvision==0.20.0+cu124'
           )
           Invoke-Checked $python @('-m', 'pip', 'install', '-r', 'requirements-windows.txt')
-          $wheels = @(Get-ChildItem -LiteralPath 'wheels' -Filter '*.whl' -File)
-          if ($wheels.Count -ne 3) { throw 'Expected three RSCD wheels in the wheels folder' }
           Invoke-Checked $python (@('-m', 'pip', 'install', '--no-deps') + @($wheels.FullName))
           Invoke-Checked $python @('-m', 'pip', 'check')
           Invoke-Checked $python @(
-              '-c', 'import torch; import model.JCD; assert torch.cuda.is_available(), "CUDA unavailable. Check the NVIDIA driver."; print(torch.cuda.get_device_name(0)); print(torch.empty(1, device="cuda"))'
+              '-c', 'import torch; import model.JCD; assert torch.cuda.is_available(); print(torch.zeros(1).cuda()); print(torch.cuda.get_device_name(0))'
           )
           EOF
 
@@ -181,8 +246,10 @@ jobs:
           python -m pip check
           python -c "import torch; import model.JCD; assert torch.version.cuda == '12.4'"
           python video_inference.py --help
+          find model para data -type d -name __pycache__ -prune -exec rm -rf {} +
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload Windows installer bundle
+        uses: actions/upload-artifact@v4
         with:
           name: rscd-windows-x64-py310-cu124-sm86
           path: bundle/
